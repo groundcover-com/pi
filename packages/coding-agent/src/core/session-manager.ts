@@ -151,6 +151,34 @@ export type SessionEntry =
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
 
+export interface SessionPersistenceSnapshot {
+	header: SessionHeader;
+	entries: SessionEntry[];
+	leafId?: string | null;
+	sessionFile?: string;
+	flushed?: boolean;
+}
+
+export interface SessionPersistenceAppendInput {
+	header: SessionHeader;
+	entry: SessionEntry;
+	previousLeafId: string | null;
+	nextLeafId: string;
+	entryCount: number;
+	sessionFile?: string;
+}
+
+export interface SessionPersistenceRewriteInput extends SessionPersistenceSnapshot {
+	reason: "initialize" | "rewrite" | "new_session" | "branch";
+}
+
+export interface SessionPersistenceStore {
+	load(): Promise<SessionPersistenceSnapshot | null>;
+	initialize(input: SessionPersistenceRewriteInput): Promise<void>;
+	appendEntry(input: SessionPersistenceAppendInput): Promise<void>;
+	rewrite(input: SessionPersistenceRewriteInput): Promise<void>;
+}
+
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
 	entry: SessionEntry;
@@ -766,6 +794,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private durableStore: SessionPersistenceStore | undefined;
 
 	private constructor(
 		cwd: string,
@@ -773,10 +802,12 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
+		durableStore?: SessionPersistenceStore,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
+		this.durableStore = durableStore;
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
@@ -848,6 +879,14 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	async newSessionAsync(options?: NewSessionOptions): Promise<string | undefined> {
+		const sessionFile = this.newSession(options);
+		if (this.durableStore) {
+			await this.durableStore.initialize({ ...this._toSnapshot(), reason: "new_session" });
+		}
+		return sessionFile;
+	}
+
 	private _buildIndex(): void {
 		this.byId.clear();
 		this.labelsById.clear();
@@ -867,6 +906,32 @@ export class SessionManager {
 				}
 			}
 		}
+	}
+
+	private _loadSnapshot(snapshot: SessionPersistenceSnapshot): void {
+		this.fileEntries = [snapshot.header, ...snapshot.entries];
+		this.sessionId = snapshot.header.id;
+		this.cwd = resolvePath(snapshot.header.cwd || this.cwd);
+		this.sessionFile = snapshot.sessionFile ?? this.sessionFile;
+		this.flushed = snapshot.flushed ?? false;
+		this._buildIndex();
+		if (snapshot.leafId !== undefined) {
+			this.leafId = snapshot.leafId;
+		}
+	}
+
+	private _toSnapshot(): SessionPersistenceSnapshot {
+		const header = this.getHeader();
+		if (!header) {
+			throw new Error("Cannot persist session without a session header");
+		}
+		return {
+			header,
+			entries: this.getEntries(),
+			leafId: this.leafId,
+			sessionFile: this.sessionFile,
+			flushed: this.flushed,
+		};
 	}
 
 	private _rewriteFile(): void {
@@ -941,6 +1006,25 @@ export class SessionManager {
 		this._persist(entry);
 	}
 
+	private async _appendEntryAsync(entry: SessionEntry): Promise<void> {
+		const previousLeafId = this.leafId;
+		if (this.durableStore) {
+			const header = this.getHeader();
+			if (!header) {
+				throw new Error("Cannot append durable session entry without a session header");
+			}
+			await this.durableStore.appendEntry({
+				header,
+				entry,
+				previousLeafId,
+				nextLeafId: entry.id,
+				entryCount: this.getEntries().length + 1,
+				sessionFile: this.sessionFile,
+			});
+		}
+		this._appendEntry(entry);
+	}
+
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
 	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.
 	 * Reason: we want these to be top-level entries in the session, not message session entries,
@@ -959,6 +1043,18 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	async appendMessageAsync(message: Message | CustomMessage | BashExecutionMessage): Promise<string> {
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			message,
+		};
+		await this._appendEntryAsync(entry);
+		return entry.id;
+	}
+
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
@@ -969,6 +1065,18 @@ export class SessionManager {
 			thinkingLevel,
 		};
 		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	async appendThinkingLevelChangeAsync(thinkingLevel: string): Promise<string> {
+		const entry: ThinkingLevelChangeEntry = {
+			type: "thinking_level_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			thinkingLevel,
+		};
+		await this._appendEntryAsync(entry);
 		return entry.id;
 	}
 
@@ -983,6 +1091,19 @@ export class SessionManager {
 			modelId,
 		};
 		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	async appendModelChangeAsync(provider: string, modelId: string): Promise<string> {
+		const entry: ModelChangeEntry = {
+			type: "model_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			provider,
+			modelId,
+		};
+		await this._appendEntryAsync(entry);
 		return entry.id;
 	}
 
@@ -1009,6 +1130,28 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	async appendCompactionAsync<T = unknown>(
+		summary: string,
+		firstKeptEntryId: string,
+		tokensBefore: number,
+		details?: T,
+		fromHook?: boolean,
+	): Promise<string> {
+		const entry: CompactionEntry<T> = {
+			type: "compaction",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			summary,
+			firstKeptEntryId,
+			tokensBefore,
+			details,
+			fromHook,
+		};
+		await this._appendEntryAsync(entry);
+		return entry.id;
+	}
+
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
 		const entry: CustomEntry = {
@@ -1023,6 +1166,19 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	async appendCustomEntryAsync(customType: string, data?: unknown): Promise<string> {
+		const entry: CustomEntry = {
+			type: "custom",
+			customType,
+			data,
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+		};
+		await this._appendEntryAsync(entry);
+		return entry.id;
+	}
+
 	/** Append a session info entry (e.g., display name). Returns entry id. */
 	appendSessionInfo(name: string): string {
 		const entry: SessionInfoEntry = {
@@ -1033,6 +1189,18 @@ export class SessionManager {
 			name: name.trim(),
 		};
 		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	async appendSessionInfoAsync(name: string): Promise<string> {
+		const entry: SessionInfoEntry = {
+			type: "session_info",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			name: name.trim(),
+		};
+		await this._appendEntryAsync(entry);
 		return entry.id;
 	}
 
@@ -1075,6 +1243,26 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 		};
 		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	async appendCustomMessageEntryAsync<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): Promise<string> {
+		const entry: CustomMessageEntry<T> = {
+			type: "custom_message",
+			customType,
+			content,
+			display,
+			details,
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+		};
+		await this._appendEntryAsync(entry);
 		return entry.id;
 	}
 
@@ -1132,6 +1320,29 @@ export class SessionManager {
 			label,
 		};
 		this._appendEntry(entry);
+		if (label) {
+			this.labelsById.set(targetId, label);
+			this.labelTimestampsById.set(targetId, entry.timestamp);
+		} else {
+			this.labelsById.delete(targetId);
+			this.labelTimestampsById.delete(targetId);
+		}
+		return entry.id;
+	}
+
+	async appendLabelChangeAsync(targetId: string, label: string | undefined): Promise<string> {
+		if (!this.byId.has(targetId)) {
+			throw new Error(`Entry ${targetId} not found`);
+		}
+		const entry: LabelEntry = {
+			type: "label",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			targetId,
+			label,
+		};
+		await this._appendEntryAsync(entry);
 		if (label) {
 			this.labelsById.set(targetId, label);
 			this.labelTimestampsById.set(targetId, entry.timestamp);
@@ -1278,6 +1489,30 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	async branchWithSummaryAsync(
+		branchFromId: string | null,
+		summary: string,
+		details?: unknown,
+		fromHook?: boolean,
+	): Promise<string> {
+		if (branchFromId !== null && !this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		this.leafId = branchFromId;
+		const entry: BranchSummaryEntry = {
+			type: "branch_summary",
+			id: generateId(this.byId),
+			parentId: branchFromId,
+			timestamp: new Date().toISOString(),
+			fromId: branchFromId ?? "root",
+			summary,
+			details,
+			fromHook,
+		};
+		await this._appendEntryAsync(entry);
+		return entry.id;
+	}
+
 	/**
 	 * Create a new session file containing only the path from root to the specified leaf.
 	 * Useful for extracting a single conversation path from a branched session.
@@ -1385,6 +1620,39 @@ export class SessionManager {
 	static create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		return new SessionManager(cwd, dir, undefined, true, options);
+	}
+
+	static async createWithStore(
+		cwd: string,
+		store: SessionPersistenceStore,
+		options: {
+			sessionDir?: string;
+			sessionFile?: string;
+			newSession?: NewSessionOptions;
+			persistToFile?: boolean;
+		} = {},
+	): Promise<SessionManager> {
+		const dir = options.sessionDir ? normalizePath(options.sessionDir) : getDefaultSessionDir(cwd);
+		const manager = new SessionManager(
+			cwd,
+			dir,
+			options.sessionFile,
+			options.persistToFile ?? false,
+			options.newSession,
+			store,
+		);
+		const snapshot = await store.load();
+		if (snapshot) {
+			manager._loadSnapshot(snapshot);
+			if (manager.persist && manager.sessionFile) {
+				manager._rewriteFile();
+				manager.flushed = true;
+			}
+			return manager;
+		}
+
+		await store.initialize({ ...manager._toSnapshot(), reason: "initialize" });
+		return manager;
 	}
 
 	/**
