@@ -362,14 +362,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (hasExistingSession) {
 		agent.state.messages = existingSession.messages;
 		if (!hasThinkingEntry) {
-			sessionManager.appendThinkingLevelChange(thinkingLevel);
+			await sessionManager.appendThinkingLevelChangeAsync(thinkingLevel);
 		}
 	} else {
 		// Save initial model and thinking level for new sessions so they can be restored on resume
 		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
+			await sessionManager.appendModelChangeAsync(model.provider, model.id);
 		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
+		await sessionManager.appendThinkingLevelChangeAsync(thinkingLevel);
 	}
 
 	const session = new AgentSession({
