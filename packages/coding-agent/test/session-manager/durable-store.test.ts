@@ -107,4 +107,27 @@ describe("SessionManager durable store", () => {
 		expect(session.getLeafId()).toBeNull();
 		expect(store.snapshot?.entries).toHaveLength(0);
 	});
+
+	it("keeps branch summary async state atomic when durable append fails", async () => {
+		const store = new MemorySessionStore();
+		const session = await SessionManager.createWithStore("/tmp/pi-durable", store, {
+			newSession: { id: "durable-session" },
+		});
+		const firstId = await session.appendMessageAsync({ role: "user", content: "hello", timestamp: 1 });
+		const secondId = await session.appendCustomEntryAsync("zubin", { ok: true });
+		store.failNextAppend = true;
+
+		await expect(session.branchWithSummaryAsync(firstId, "branch summary")).rejects.toThrow("durable append failed");
+
+		expect(session.getLeafId()).toBe(secondId);
+		expect(session.getEntries().map((entry) => entry.id)).toEqual([firstId, secondId]);
+		expect(store.snapshot?.leafId).toBe(secondId);
+		expect(store.snapshot?.entries.map((entry) => entry.id)).toEqual([firstId, secondId]);
+
+		const summaryId = await session.branchWithSummaryAsync(firstId, "branch summary");
+		const summaryAppend = store.appends[store.appends.length - 1];
+		expect(summaryAppend).toMatchObject({ previousLeafId: secondId, nextLeafId: summaryId });
+		expect(summaryAppend?.entry).toMatchObject({ id: summaryId, parentId: firstId, type: "branch_summary" });
+		expect(session.getLeafId()).toBe(summaryId);
+	});
 });
